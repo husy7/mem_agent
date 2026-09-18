@@ -1,0 +1,44 @@
+[project]
+name = "memagent"
+version = "0.1.0"
+description = "有状态长期记忆智能体：工具调用 + 三层记忆 + Agentic RAG"
+requires-python = ">=3.12"
+dependencies = [
+    # --- 编排（阶段一）---
+    "langgraph==1.2.11",
+    "langchain-core==1.6.3",
+    # --- LLM（阶段一，直连 OpenAI SDK 调 DeepSeek Responses API）---
+    "openai==3.15.0",
+    # --- 工具沙箱（阶段一，bashkit VFS）---
+    "bashkit[langchain]==0.18.1",
+    # --- 配置与日志（阶段一）---
+    "pydantic-settings==2.15.0",
+    "structlog==26.1.0",
+    "python-dotenv==1.2.3",
+]
+
+[project.optional-dependencies]
+# 阶段二 / 阶段三 依赖先声明不装，避免阶段一被 Qdrant/Postgres 拖慢
+memory = ["qdrant-client>=1.19.0", "psycopg[binary]>=3.2", "redis>=5.0"]
+rag = ["rank-bm25>=0.2.2"]
+eval = ["ragas>=0.2", "langfuse>=3.0", "streamlit>=1.52"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0", "pytest-cov==7.1.0"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+
+[tool.coverage.run]
+source = ["memagent"]
+branch = true

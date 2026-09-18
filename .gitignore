@@ -8,4 +8,5 @@ htmlcov/
 .env.local
 *.log
 data/
-.qdrant_storage/
+.qdrant_storage/*.egg-info/
+src/*.egg-info/
