@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from collections.abc import Generator
 
 import pytest
 
@@ -35,7 +36,7 @@ class _Capture(io.StringIO):
 
 
 @pytest.fixture
-def captured() -> _Capture:
+def captured() -> Generator[_Capture, None, None]:
     buf = _Capture()
     configure_logging(stream=buf)
     yield buf
