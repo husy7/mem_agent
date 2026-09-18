@@ -1,9 +1,15 @@
 """配置层单元测试。
 
-测试隔离策略（这是踩过坑才定下来的）：
-    OS 环境变量 **优先于** .env（已实测确认），因此用 monkeypatch.setenv 覆盖即可。
-    **不要**依赖 Settings(_env_file=None) —— 各分组自己也声明了 env_file，
-    会独立再读一遍 .env，根上的 _env_file=None 管不到它们。
+本项目的配置决策：**只从 .env 读**，不依赖 OS 环境变量。
+因此测试里区分两件事，用两个测试分别覆盖：
+    1. 字段默认值（pydantic 层）—— 需要显式隔离 .env 才测得准
+    2. .env 实际生效值（运行配置）—— 断言读到了 .env，不断言具体数值
+
+隔离手段（实测结论，别再用别的写法）：
+    ❌ Settings(_env_file=None)        —— 各分组继承了根的 env_file，管不到它们
+    ❌ LLMSettings(_env_file=None)     —— 同上，仍然读 .env
+    ❌ patch PROJECT_ROOT              —— env_file 在类定义时就固定成绝对路径了
+    ✅ 临时替换分组的 model_config['env_file'] = None  —— 唯一有效，见 env_isolated()
 
 注意：这里用 print 输出测试判定过程是刻意的——
 全局禁止事项禁的是「用 print 调试业务代码」，不是禁测试报告结果。
@@ -12,6 +18,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
@@ -24,6 +33,29 @@ from memagent.config import (
     _validate_log_level,
     _validate_workspace,
 )
+
+
+@contextmanager
+def env_isolated(*groups: type[Any]) -> Iterator[None]:
+    """临时让指定分组不读 .env，测「纯字段默认值」用。
+
+    原理：env_file 在类定义时就被写进 model_config 了，实例级参数改不动它，
+    只能临时替换类属性。必须还原，否则污染后续所有测试。
+    """
+    from memagent.config import _GroupSettings  # noqa: PLC0415 - 只在测试里需要
+
+    targets = groups or tuple(_GroupSettings.__subclasses__())
+    saved: list[tuple[type[Any], dict[str, Any]]] = []
+    for group in targets:
+        saved.append((group, dict(group.model_config)))
+        patched = dict(group.model_config)
+        patched["env_file"] = None
+        group.model_config = patched  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        for group, original in saved:
+            group.model_config = original  # type: ignore[assignment]
 
 # 所有会被本测试触及的环境变量。任何测试结束后都必须清干净，
 # 否则本机 shell 里真设了同名变量（例如你申请到 key 后 export 了），
@@ -51,7 +83,7 @@ _ENV_KEYS = (
 
 
 @pytest.fixture(autouse=True)
-def sanitize_env() -> None:
+def sanitize_env():
     """每个测试前清空相关环境变量并清配置缓存，保证相互独立。"""
     saved = {k: os.environ.pop(k, None) for k in _ENV_KEYS}
     from memagent.config import get_settings
@@ -125,12 +157,11 @@ def test_api_key_placeholders_are_rejected() -> None:
 
 
 def test_model_defaults_are_sane() -> None:
-    """模型默认值必须整体自洽（逐个分组显式断开 .env）。
+    """字段默认值必须整体自洽（显式隔离 .env 后才测得准）。
 
-    为什么不测 Settings() 的"默认值"：实测各分组会**继承根的 env_file 配置**，
-    所以 Settings() 和你直接实例化分组都会读 .env；
-    而且 env_file 在类定义时就固定了，patch PROJECT_ROOT 无效。
-    唯一可行的默认值测试是给每个分组显式传 _env_file=None。
+    为什么不测 Settings() 的"默认值"：各分组继承了根的 env_file 配置，
+    所以 Settings() 和直接实例化分组都会读 .env，拿到的是运行配置而不是默认值。
+    实测三种隔离写法里只有「临时替换 model_config['env_file']」有效。
     """
     from memagent.config import (
         AgentSettings,
@@ -140,11 +171,13 @@ def test_model_defaults_are_sane() -> None:
         WebSearchSettings,
     )
 
-    llm = LLMSettings(_env_file=None)
-    sandbox = SandboxSettings(_env_file=None)
-    agent = AgentSettings(_env_file=None)
-    log = LogSettings(_env_file=None)
-    web = WebSearchSettings(_env_file=None)
+    with env_isolated(LLMSettings, SandboxSettings, AgentSettings, LogSettings, WebSearchSettings):
+        llm = LLMSettings()
+        sandbox = SandboxSettings()
+        agent = AgentSettings()
+        log = LogSettings()
+        web = WebSearchSettings()
+        cs = Settings()
 
     print(f"\n  llm.model              = {llm.model!r}")
     print(f"  llm.api_key            = {llm.api_key!r}")
@@ -155,11 +188,14 @@ def test_model_defaults_are_sane() -> None:
     print(f"  sandbox.max_commands   = {sandbox.max_commands!r}")
     print(f"  sandbox.max_read_bytes = {sandbox.max_read_bytes!r}")
     print(f"  sandbox.max_write_bytes= {sandbox.max_write_bytes!r}")
+    print(f"  sandbox.timeout_seconds= {sandbox.timeout_seconds!r}")
     print(f"  web_search.provider    = {web.provider!r}")
+    print(f"  web_search.max_results = {web.max_results!r}")
     print(f"  agent.max_steps        = {agent.max_steps!r}")
     print(f"  agent.tool_max_retries = {agent.tool_max_retries!r}")
     print(f"  log.level              = {log.level!r}")
     print(f"  log.json_output        = {log.json_output!r}")
+    print(f"  Settings().log_level_int = {cs.log_level_int}")
 
     assert llm.model == "deepseek-flash"
     assert llm.api_key is None
@@ -168,12 +204,64 @@ def test_model_defaults_are_sane() -> None:
     assert llm.max_retries == 2
     assert sandbox.workspace == "/workspace"
     assert sandbox.max_commands == 500
+    assert sandbox.max_loop_iterations == 5000
+    assert sandbox.timeout_seconds == 30.0
     assert sandbox.max_read_bytes < sandbox.max_write_bytes
     assert web.provider == "tavily"
+    assert web.max_results == 5
     assert agent.max_steps == 10
     assert agent.tool_max_retries == 2
     assert log.level == "INFO"
     assert log.json_output is True
+    assert cs.log_level_int == LOG_LEVELS["INFO"]
+
+
+def test_defaults_test_independent_of_env_file_content() -> None:
+    """回归：默认值测试不能在 .env 内容变化时失败。
+
+    踩过的坑：test_model_defaults_are_sane 最初写成 LLMSettings()，
+    而各分组会读 .env，于是它断言的是「.env 的值」却用字段默认值去比。
+    表现为：单独跑失败、全量跑通过（因为全量时别的测试先清了环境变量），
+    —— 「测试结果依赖执行集合」是测试设计缺陷，不是环境问题。
+
+    本测试用差异值改写 .env，验证隔离手段在 .env 变化时仍然成立。
+    """
+    from dotenv import dotenv_values
+
+    from memagent.config import PROJECT_ROOT, AgentSettings, LogSettings, SandboxSettings
+
+    env_path = PROJECT_ROOT / ".env"
+    backup = env_path.read_text(encoding="utf-8")
+    mutated = (
+        backup.replace("SANDBOX_MAX_COMMANDS=500", "SANDBOX_MAX_COMMANDS=777")
+        .replace("AGENT_MAX_STEPS=10", "AGENT_MAX_STEPS=33")
+        .replace("LOG_LEVEL=INFO", "LOG_LEVEL=DEBUG")
+    )
+    if mutated == backup:
+        pytest.skip(".env 中没有可用于判别的键，跳过")
+
+    try:
+        env_path.write_text(mutated, encoding="utf-8")
+        loaded = dotenv_values(env_path)
+        print(f"\n  改写 .env：SANDBOX_MAX_COMMANDS={loaded.get('SANDBOX_MAX_COMMANDS')} "
+              f"AGENT_MAX_STEPS={loaded.get('AGENT_MAX_STEPS')} LOG_LEVEL={loaded.get('LOG_LEVEL')}")
+
+        assert SandboxSettings().max_commands == 777, "不隔离时应读到 .env 的值"
+        assert AgentSettings().max_steps == 33
+        assert LogSettings().level == "DEBUG"
+        print("  ✅ 不隔离时确实读到 .env（说明判别值有效）")
+
+        with env_isolated(SandboxSettings, AgentSettings, LogSettings):
+            assert SandboxSettings().max_commands == 500, "隔离后应回到字段默认值"
+            assert AgentSettings().max_steps == 10
+            assert LogSettings().level == "INFO"
+        print("  ✅ 隔离后回到字段默认值（env_isolated 有效）")
+
+        assert SandboxSettings().max_commands == 777, "退出上下文必须还原，否则污染后续测试"
+        print("  ✅ 退出上下文后已还原")
+    finally:
+        env_path.write_text(backup, encoding="utf-8")
+        print("  .env 已还原")
 
 
 def test_effective_env_var_names_are_documented() -> None:
@@ -196,22 +284,22 @@ def test_effective_env_var_names_are_documented() -> None:
     print("    AGENT_MAX_STEPS / TOOL_MAX_RETRIES（不是 AGENT_TOOL_MAX_RETRIES）")
 
     os.environ["DEEPSEEK_TIMEOUT_SECONDS"] = "99"
-    assert LLMSettings(_env_file=None).timeout_seconds == 99.0
+    assert LLMSettings().timeout_seconds == 99.0
     print("  ✅ DEEPSEEK_TIMEOUT_SECONDS 生效")
     os.environ.pop("DEEPSEEK_TIMEOUT_SECONDS")
 
     os.environ["LOG_JSON_OUTPUT"] = "false"
-    assert LogSettings(_env_file=None).json_output is False
+    assert LogSettings().json_output is False
     print("  ✅ LOG_JSON_OUTPUT 生效")
     os.environ.pop("LOG_JSON_OUTPUT")
 
     os.environ["TOOL_MAX_RETRIES"] = "4"
-    assert AgentSettings(_env_file=None).tool_max_retries == 4
+    assert AgentSettings().tool_max_retries == 4
     print("  ✅ TOOL_MAX_RETRIES 生效（validation_alias 覆盖了 AGENT_ 前缀）")
     os.environ.pop("TOOL_MAX_RETRIES")
 
     os.environ["AGENT_TOOL_MAX_RETRIES"] = "4"
-    still_default = AgentSettings(_env_file=None).tool_max_retries == 2
+    still_default = AgentSettings().tool_max_retries == 2
     os.environ.pop("AGENT_TOOL_MAX_RETRIES")
     assert still_default, "AGENT_TOOL_MAX_RETRIES 竟然生效了？那就该更新配置与文档"
     print("  ✅ AGENT_TOOL_MAX_RETRIES 不生效（符合预期，已用 TOOL_MAX_RETRIES 替代）")
